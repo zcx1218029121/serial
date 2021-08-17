@@ -3,166 +3,101 @@ package serial
 import (
 	"fmt"
 	"syscall"
+	"unsafe"
 )
 
-type port struct {
-	handle syscall.Handle
-
-	oldDCB      c_DCB
-	oldTimeouts c_COMMTIMEOUTS
+var baudRates = map[int]uint32{
+	50:      syscall.B50,
+	75:      syscall.B75,
+	110:     syscall.B110,
+	134:     syscall.B134,
+	150:     syscall.B150,
+	200:     syscall.B200,
+	300:     syscall.B300,
+	600:     syscall.B600,
+	1200:    syscall.B1200,
+	1800:    syscall.B1800,
+	2400:    syscall.B2400,
+	4800:    syscall.B4800,
+	9600:    syscall.B9600,
+	19200:   syscall.B19200,
+	38400:   syscall.B38400,
+	57600:   syscall.B57600,
+	115200:  syscall.B115200,
+	230400:  syscall.B230400,
+	460800:  syscall.B460800,
+	500000:  syscall.B500000,
+	576000:  syscall.B576000,
+	921600:  syscall.B921600,
+	1000000: syscall.B1000000,
+	1152000: syscall.B1152000,
+	1500000: syscall.B1500000,
+	2000000: syscall.B2000000,
+	2500000: syscall.B2500000,
+	3000000: syscall.B3000000,
+	3500000: syscall.B3500000,
+	4000000: syscall.B4000000,
 }
 
-// New allocates and returns a new serial port controller.
-func New() Port {
-	return &port{
-		handle: syscall.InvalidHandle,
-	}
+var charSizes = map[int]uint32{
+	5: syscall.CS5,
+	6: syscall.CS6,
+	7: syscall.CS7,
+	8: syscall.CS8,
 }
 
-// Open connects to the given serial port.
-func (p *port) Open(c *Config) (err error) {
-	p.handle, err = newHandle(c)
-	if err != nil {
-		return
-	}
-	defer func() {
-		if err != nil {
-			syscall.CloseHandle(p.handle)
-			p.handle = syscall.InvalidHandle
-		}
-	}()
-	err = p.setSerialConfig(c)
-	if err != nil {
-		return
-	}
-	err = p.setTimeouts(c)
-	return
-}
-
-func (p *port) Close() (err error) {
-	if p.handle == syscall.InvalidHandle {
-		return
-	}
-	err1 := SetCommTimeouts(p.handle, &p.oldTimeouts)
-	err2 := SetCommState(p.handle, &p.oldDCB)
-	err = syscall.CloseHandle(p.handle)
-	if err == nil {
-		if err1 == nil {
-			err = err2
-		} else {
-			err = err1
-		}
-	}
-	p.handle = syscall.InvalidHandle
-	return
-}
-
-// Read reads from serial port.
-// It is blocked until data received or timeout after p.timeout.
-func (p *port) Read(b []byte) (n int, err error) {
-	var done uint32
-	if err = syscall.ReadFile(p.handle, b, &done, nil); err != nil {
-		return
-	}
-	if done == 0 {
-		err = ErrTimeout
-		return
-	}
-	n = int(done)
-	return
-}
-
-// Write writes data to the serial port.
-func (p *port) Write(b []byte) (n int, err error) {
-	var done uint32
-	if err = syscall.WriteFile(p.handle, b, &done, nil); err != nil {
-		return
-	}
-	n = int(done)
-	return
-}
-
-func (p *port) setTimeouts(c *Config) error {
-	var timeouts c_COMMTIMEOUTS
-	// Read and write timeout
-	if c.Timeout > 0 {
-		timeout := toDWORD(int(c.Timeout.Nanoseconds() / 1e6))
-		// wait until a byte arrived or time out
-		timeouts.ReadIntervalTimeout = c_MAXDWORD
-		timeouts.ReadTotalTimeoutMultiplier = c_MAXDWORD
-		timeouts.ReadTotalTimeoutConstant = timeout
-		timeouts.WriteTotalTimeoutConstant = timeout
-	}
-	err := GetCommTimeouts(p.handle, &p.oldTimeouts)
-	if err != nil {
-		return err
-	}
-	err = SetCommTimeouts(p.handle, &timeouts)
-	if err != nil {
-		// reset
-		SetCommTimeouts(p.handle, &p.oldTimeouts)
-	}
+// syscallSelect is a wapper for syscall.Select that only returns error.
+func syscallSelect(n int, r *syscall.FdSet, w *syscall.FdSet, e *syscall.FdSet, tv *syscall.Timeval) error {
+	_, err := syscall.Select(n, r, w, e, tv)
 	return err
 }
 
-func (p *port) setSerialConfig(c *Config) error {
-	var dcb c_DCB
-	if c.BaudRate == 0 {
-		dcb.BaudRate = 19200
-	} else {
-		dcb.BaudRate = toDWORD(c.BaudRate)
+// tcsetattr sets terminal file descriptor parameters.
+// See man tcsetattr(3).
+func tcsetattr(fd int, termios *syscall.Termios) (err error) {
+	r, _, errno := syscall.Syscall(uintptr(syscall.SYS_IOCTL),
+		uintptr(fd), uintptr(syscall.TCSETS), uintptr(unsafe.Pointer(termios)))
+	if errno != 0 {
+		err = errno
+		return
 	}
-	// Data bits
-	if c.DataBits == 0 {
-		dcb.ByteSize = 8
-	} else {
-		dcb.ByteSize = toBYTE(c.DataBits)
+	if r != 0 {
+		err = fmt.Errorf("tcsetattr failed %v", r)
 	}
-	// Stop bits
-	switch c.StopBits {
-	case 0, 1:
-		// Default is one stop bit.
-		dcb.StopBits = c_ONESTOPBIT
-	case 2:
-		dcb.StopBits = c_TWOSTOPBITS
-	default:
-		return fmt.Errorf("serial: unsupported stop bits %v", c.StopBits)
-	}
-	// Parity
-	switch c.Parity {
-	case "", "E":
-		// Default parity mode is Even.
-		dcb.Parity = c_EVENPARITY
-		dcb.Pad_cgo_0[0] |= 0x02 // fParity
-	case "O":
-		dcb.Parity = c_ODDPARITY
-		dcb.Pad_cgo_0[0] |= 0x02 // fParity
-	case "N":
-		dcb.Parity = c_NOPARITY
-	default:
-		return fmt.Errorf("serial: unsupported parity %v", c.Parity)
-	}
-	dcb.Pad_cgo_0[0] |= 0x01 // fBinary
-
-	err := GetCommState(p.handle, &p.oldDCB)
-	if err != nil {
-		return err
-	}
-	err = SetCommState(p.handle, &dcb)
-	if err != nil {
-		SetCommState(p.handle, &p.oldDCB)
-	}
-	return err
+	return
 }
 
-func newHandle(c *Config) (handle syscall.Handle, err error) {
-	handle, err = syscall.CreateFile(
-		syscall.StringToUTF16Ptr(c.Address),
-		syscall.GENERIC_READ|syscall.GENERIC_WRITE,
-		0,                     // mode
-		nil,                   // security
-		syscall.OPEN_EXISTING, // create mode
-		0,                     // attributes
-		0)                     // templates
+// tcgetattr gets terminal file descriptor parameters.
+// See man tcgetattr(3).
+func tcgetattr(fd int, termios *syscall.Termios) (err error) {
+	r, _, errno := syscall.Syscall(uintptr(syscall.SYS_IOCTL),
+		uintptr(fd), uintptr(syscall.TCGETS), uintptr(unsafe.Pointer(termios)))
+	if errno != 0 {
+		err = errno
+		return
+	}
+	if r != 0 {
+		err = fmt.Errorf("tcgetattr failed %v", r)
+		return
+	}
 	return
+}
+
+// fdget returns index and offset of fd in fds.
+func fdget(fd int, fds *syscall.FdSet) (index, offset int) {
+	index = fd / (syscall.FD_SETSIZE / len(fds.Bits)) % len(fds.Bits)
+	offset = fd % (syscall.FD_SETSIZE / len(fds.Bits))
+	return
+}
+
+// fdset implements FD_SET macro.
+func fdset(fd int, fds *syscall.FdSet) {
+	idx, pos := fdget(fd, fds)
+	fds.Bits[idx] = 1 << uint(pos)
+}
+
+// fdisset implements FD_ISSET macro.
+func fdisset(fd int, fds *syscall.FdSet) bool {
+	idx, pos := fdget(fd, fds)
+	return fds.Bits[idx]&(1<<uint(pos)) != 0
 }
